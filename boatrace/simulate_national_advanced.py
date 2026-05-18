@@ -1,15 +1,27 @@
+"""
+simulate_national_advanced.py
+
+2023年で学習し、2024年（未知データ）で最終評価する。
+パラメータは simulate_national.py のバリデーション結果から設定すること。
+ここでは新たなパラメータ探索をしない（テスト汚染の防止）。
+"""
 import pandas as pd
 import lightgbm as lgb
 import warnings
 
-from utils import add_features, FEATURES
+from utils import add_features, FEATURES, bootstrap_roi
 
 warnings.filterwarnings('ignore')
 
-print("=== 🧪 全国版AI 未来シミュレーション (リミッター解除版) ===")
+print("=== 🧪 全国版AI 未来シミュレーション（固定パラメータ・正規評価版）===")
+
+# simulate_national.py の出力から設定する
+BEST_THRESHOLD = 0.18
+BEST_N2        = 2
+BEST_N3        = 3
 
 TRAIN_CSV = "race_results_20230101_to_20231231_ALL.csv"
-TEST_CSV  = "race_results_20240303_to_20240331_ALL.csv"
+TEST_CSV  = "race_results_20240101_to_20241231_ALL.csv"
 
 try:
     train_df = pd.read_csv(TRAIN_CSV)
@@ -27,137 +39,145 @@ def process(df):
     return df
 
 
-print("AIを構築中...")
 train_df = process(train_df)
 test_df  = process(test_df)
 
-print(f"\n🧠 学習中... ({len(train_df)}行)")
+print(f"学習データ: {len(train_df)}行 (2023年)")
+print(f"評価データ: {len(test_df)}行 (2024年)")
+
+print(f"\n🧠 AIを学習中...")
 model = lgb.LGBMClassifier(
     n_estimators=150, learning_rate=0.05,
     subsample=0.8, colsample_bytree=0.8,
     random_state=42, objective='multiclass',
+    class_weight='balanced',
 )
 model.fit(train_df[FEATURES], train_df['target'], categorical_feature=['stadium', 'boat_num'])
 
-print(f"🔮 予測中... ({len(test_df)}行)")
+print(f"🔮 2024年データを予測中...")
 probs = model.predict_proba(test_df[FEATURES])
 test_df = test_df.copy()
 test_df['prob_1st'] = probs[:, 0]
 test_df['prob_2nd'] = probs[:, 1]
 test_df['prob_3rd'] = probs[:, 2]
 
-print("\n=== 💰 2024年データで最強設定を探索中... ===")
+# ── 全体評価 ───────────────────────────────────────────────────
+print(f"\n=== 📊 固定パラメータで評価（穴閾値={BEST_THRESHOLD*100:.0f}%, 2着={BEST_N2}艇, 3着={BEST_N3}艇）===")
 
-thresholds_1st = [0.15, 0.18, 0.20]
-num_2nd_list   = [3, 4]
-num_3rd_list   = [4, 5]
+trades_all  = []
+std_records = {}  # {std_code: [(inv, ret), ...]}
 
-results_log  = []
-grouped_test = test_df.groupby(['date', 'stadium', 'race_no'])
+for (date, std, rno), race in test_df.groupby(['date', 'stadium', 'race_no']):
+    if len(race) != 6:
+        continue
+    boat1_prob = race[race['boat_num'] == 1]['prob_1st'].values[0]
+    if boat1_prob >= 0.50:
+        continue
 
-for t1 in thresholds_1st:
-    for n2 in num_2nd_list:
-        for n3 in num_3rd_list:
-            if n2 > n3:
-                continue
+    non1 = race[race['boat_num'] != 1]
+    best = non1.loc[non1['prob_1st'].idxmax()]
+    if best['prob_1st'] < BEST_THRESHOLD:
+        continue
 
-            total_inv = total_ret = buy_cnt = hit_cnt = total_tickets = 0
-            std_stats = {f"{i:02d}": {'inv': 0, 'ret': 0, 'hit': 0, 'buy': 0} for i in range(1, 25)}
+    pivot  = int(best['boat_num'])
+    remain = race[race['boat_num'] != pivot]
 
-            for (date, std, rno), race_data in grouped_test:
-                if len(race_data) != 6:
-                    continue
+    boats_2nd = remain.nlargest(BEST_N2, 'prob_2nd')['boat_num'].astype(int).tolist()
+    boats_3rd = remain.nlargest(BEST_N3, 'prob_3rd')['boat_num'].astype(int).tolist()
 
-                boat1_prob = race_data[race_data['boat_num'] == 1]['prob_1st'].values[0]
-                if boat1_prob >= 0.50:
-                    continue
+    tickets = [(pivot, b2, b3) for b2 in boats_2nd for b3 in boats_3rd if b2 != b3]
+    if not tickets:
+        continue
 
-                non1     = race_data[race_data['boat_num'] != 1]
-                boat_1st = non1.loc[non1['prob_1st'].idxmax()]
-                if boat_1st['prob_1st'] < t1:
-                    continue
+    inv = len(tickets) * 100
+    a1  = race[race['rank'] == 1]['boat_num'].values
+    a2  = race[race['rank'] == 2]['boat_num'].values
+    a3  = race[race['rank'] == 3]['boat_num'].values
 
-                pivot  = int(boat_1st['boat_num'])
-                remain = race_data[race_data['boat_num'] != pivot]
+    ret = 0
+    if len(a1) > 0 and len(a2) > 0 and len(a3) > 0:
+        result = (int(a1[0]), int(a2[0]), int(a3[0]))
+        if result in tickets:
+            pays = race['payoff'].dropna()
+            if not pays.empty:
+                ret = pays.iloc[0]
 
-                boats_2nd = remain.nlargest(n2, 'prob_2nd')['boat_num'].astype(int).tolist()
-                boats_3rd = remain.nlargest(n3, 'prob_3rd')['boat_num'].astype(int).tolist()
+    trades_all.append((inv, ret))
 
-                tickets = [
-                    (pivot, b2, b3)
-                    for b2 in boats_2nd
-                    for b3 in boats_3rd
-                    if b2 != b3
-                ]
-                if not tickets:
-                    continue
+    std_code = f"{int(std):02d}"
+    std_records.setdefault(std_code, []).append((inv, ret))
 
-                inv = len(tickets) * 100
-                buy_cnt       += 1
-                total_tickets += len(tickets)
-                total_inv     += inv
-
-                std_code = f"{int(std):02d}"
-                std_stats[std_code]['buy'] += 1
-                std_stats[std_code]['inv'] += inv
-
-                a1 = race_data[race_data['rank'] == 1]['boat_num'].values
-                a2 = race_data[race_data['rank'] == 2]['boat_num'].values
-                a3 = race_data[race_data['rank'] == 3]['boat_num'].values
-
-                if len(a1) > 0 and len(a2) > 0 and len(a3) > 0:
-                    result = (int(a1[0]), int(a2[0]), int(a3[0]))
-                    if result in tickets:
-                        hit_cnt += 1
-                        std_stats[std_code]['hit'] += 1
-                        pay = race_data['payoff'].dropna()
-                        if not pay.empty:
-                            p = pay.iloc[0]
-                            total_ret += p
-                            std_stats[std_code]['ret'] += p
-
-            if buy_cnt > 0:
-                avg_tickets = total_tickets / buy_cnt
-                results_log.append({
-                    "設定":     f"穴勝率={t1*100:.0f}%, 2着={n2}艇, 3着={n3}艇",
-                    "平均点数": f"{avg_tickets:.1f}点",
-                    "レース数": buy_cnt,
-                    "的中率":   f"{hit_cnt/buy_cnt*100:.1f}%",
-                    "ROI":      f"{total_ret/total_inv*100:.1f}%",
-                    "収支":     total_ret - total_inv,
-                    "_std":     std_stats,
-                })
-
-print("\n=== 🔮 未来テスト（24年3月）全体トップ5 ===")
-results_df = pd.DataFrame(results_log)
-
-if results_df.empty:
+if not trades_all:
     print("条件に合うレースがありませんでした。")
+    exit()
+
+total_inv  = sum(t[0] for t in trades_all)
+total_ret  = sum(t[1] for t in trades_all)
+hit_count  = sum(1 for t in trades_all if t[1] > 0)
+buy_count  = len(trades_all)
+roi_point  = total_ret / total_inv * 100
+
+ci_low, ci_mid, ci_high = bootstrap_roi(trades_all)
+
+print(f"\n  賭けたレース数 : {buy_count:,}")
+print(f"  的中率         : {hit_count/buy_count*100:.1f}%")
+print(f"  収支           : {total_ret-total_inv:+,}円")
+print(f"  ROI (点推定)   : {roi_point:.1f}%")
+print(f"  ROI 95%CI      : {ci_low:.1f}% 〜 {ci_high:.1f}%  (中央値: {ci_mid:.1f}%)")
+
+if ci_low > 100:
+    print("\n✅ CI下限も100%超。この戦略は統計的に有意なエッジがある可能性が高い。")
+elif ci_high > 100:
+    print("\n⚠️ エッジがある可能性はあるが、CI下限が100%未満。2025年データで再確認推奨。")
 else:
-    results_df['ROI_num'] = results_df['ROI'].str.replace('%', '').astype(float)
-    top5 = results_df.sort_values('ROI_num', ascending=False).head(5)
-    print(top5.drop(columns=['ROI_num', '_std']).to_string(index=False))
+    print("\n❌ 2024年通年データではエッジが確認できません。モデル改良が必要です。")
 
-    best = top5.iloc[0]
-    print(f"\n=== 🏟️ 最強設定の【会場別】成績 ===")
-    print(f"対象設定: {best['設定']}")
+# ── 会場別分析 ─────────────────────────────────────────────────
+print(f"\n=== 🏟️ 会場別成績 ===")
 
-    std_log = []
-    for code, stats in best['_std'].items():
-        if stats['inv'] > 0:
-            std_log.append({
-                "会場":     code,
-                "レース数": stats['buy'],
-                "ROI":      (stats['ret'] / stats['inv']) * 100,
-                "収支":     stats['ret'] - stats['inv'],
-            })
+std_rows = []
+for std_code, records in std_records.items():
+    if not records:
+        continue
+    inv = sum(r[0] for r in records)
+    ret = sum(r[1] for r in records)
+    hits = sum(1 for r in records if r[1] > 0)
+    cnt  = len(records)
+    ci   = bootstrap_roi(records)
+    std_rows.append({
+        "会場": std_code,
+        "R数":  cnt,
+        "的中率": f"{hits/cnt*100:.0f}%",
+        "ROI":    ret / inv * 100,
+        "収支":   ret - inv,
+        "CI下限": ci[0],
+        "CI上限": ci[2],
+    })
 
-    std_df = pd.DataFrame(std_log).sort_values('ROI', ascending=False)
+std_df = pd.DataFrame(std_rows).sort_values('ROI', ascending=False)
 
-    print("\n✅ 【AIが得意な会場 トップ5】")
-    for _, r in std_df.head(5).iterrows():
-        print(f"会場 {r['会場']} : {r['レース数']:2.0f}R | ROI {r['ROI']:6.1f}% | 収支 {r['収支']:+8.0f}円")
+# CI下限が100%を超える会場（統計的に有望）
+reliable = std_df[std_df['CI下限'] > 100]
+print(f"\n✅ 【統計的に有望な会場（CI下限>100%）】 → predict_national.py の GOOD_STADIUMS に設定")
+if reliable.empty:
+    print("  該当なし（サンプル不足、または戦略の見直しが必要）")
+else:
+    for _, r in reliable.iterrows():
+        print(
+            f"  会場 {r['会場']} : {r['R数']:3.0f}R | "
+            f"ROI {r['ROI']:6.1f}% | "
+            f"95%CI [{r['CI下限']:.0f}%〜{r['CI上限']:.0f}%] | "
+            f"収支 {r['収支']:+8.0f}円"
+        )
 
-    print("\n❌ 【AIが苦手な会場 ワースト5】")
-    for _, r in std_df.tail(5).iterrows():
-        print(f"会場 {r['会場']} : {r['レース数']:2.0f}R | ROI {r['ROI']:6.1f}% | 収支 {r['収支']:+8.0f}円")
+print(f"\n❌ 【成績ワースト5会場】")
+for _, r in std_df.tail(5).iterrows():
+    print(
+        f"  会場 {r['会場']} : {r['R数']:3.0f}R | "
+        f"ROI {r['ROI']:6.1f}% | "
+        f"95%CI [{r['CI下限']:.0f}%〜{r['CI上限']:.0f}%] | "
+        f"収支 {r['収支']:+8.0f}円"
+    )
+
+print(f"\n全会場一覧:")
+print(std_df[['会場', 'R数', '的中率', 'ROI', 'CI下限', 'CI上限', '収支']].to_string(index=False))

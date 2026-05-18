@@ -1,3 +1,11 @@
+"""
+predict_national.py
+
+旧ロジックとの主な変更点:
+  1. 独立分類 → Plackett-Luce でレース内確率を正規化
+  2. 閾値フィルター → 3連単オッズを取得して期待値(EV)で買い目を選別
+  3. Kelly基準で推奨ベット比率を計算
+"""
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
@@ -5,15 +13,16 @@ import lightgbm as lgb
 import joblib
 import unicodedata
 import os
+import re
 import warnings
 from datetime import datetime
 
-from utils import add_features, FEATURES
+from utils import add_features, FEATURES, plackett_luce_prob, kelly_fraction
 
 warnings.filterwarnings('ignore')
 
 TARGET_DATE = datetime.today().strftime('%Y%m%d')
-print(f"=== 🤖 全国対応版・穴党AI予想システム ({TARGET_DATE}) ===")
+print(f"=== 🤖 全国対応版・EV最大化AI予想システム ({TARGET_DATE}) ===")
 
 while True:
     try:
@@ -34,24 +43,20 @@ while True:
     except ValueError:
         print("⚠️ 正しい数字を入力してください。")
 
-print(f"\n🚀 【会場: {JCD} / {TARGET_RACE}R】 の予想を開始します...\n")
+print(f"\n🚀 【会場: {JCD} / {TARGET_RACE}R】 予想開始...\n")
 
-# ── 得意会場フィルター ─────────────────────────────────────────
-# simulate_national_advanced.py 実行後に ROI が安定して高い会場を設定する
-# 例: GOOD_STADIUMS = ["03", "07", "15"]
-GOOD_STADIUMS = []
+# 得意会場フィルター: simulate_national_advanced.py 実行後に設定
+GOOD_STADIUMS: list = []
+MIN_EV = 0.0        # 期待値の最低ライン（0 = ゼロ以上すべて表示）
+KELLY_CAP = 0.05    # 1点あたりの最大ベット比率（5%）
+HALF_KELLY = True   # 実戦では半Kelly推奨（モデル不確実性を考慮）
 
 if GOOD_STADIUMS and JCD not in GOOD_STADIUMS:
     print(f"⚠️ 会場 {JCD} はAIの得意会場リスト外です。")
-    ans = input("それでも予測を続けますか？ (y/n): ").strip().lower()
-    if ans != 'y':
+    if input("続けますか？ (y/n): ").strip().lower() != 'y':
         exit()
 
-THRESHOLD_1ST = 0.18  # ROI 239.4% の設定（2023年バックテスト結果）
-NUM_2ND = 2
-NUM_3RD = 3
-
-# ── モデルの準備（CSVより新しくなければキャッシュ使用） ────────
+# ── モデルの準備 ───────────────────────────────────────────────
 CSV_FILENAME   = "race_results_20230101_to_20231231_ALL.csv"
 MODEL_FILENAME = "boatrace_model.pkl"
 
@@ -70,7 +75,9 @@ if retrain_needed:
     df['target'] = df['rank'].apply(lambda x: int(x) - 1 if pd.notna(x) and int(x) <= 3 else 3)
 
     model = lgb.LGBMClassifier(
-        n_estimators=100, learning_rate=0.05, random_state=42, objective='multiclass'
+        n_estimators=100, learning_rate=0.05, random_state=42,
+        objective='multiclass',
+        class_weight='balanced',
     )
     model.fit(df[FEATURES], df['target'], categorical_feature=['stadium', 'boat_num'])
     joblib.dump(model, MODEL_FILENAME)
@@ -78,6 +85,7 @@ if retrain_needed:
 else:
     print("保存済みモデルを読み込んでいます...")
     model = joblib.load(MODEL_FILENAME)
+
 
 # ── 直前情報の取得 ────────────────────────────────────────────
 print("公式サイトから直前情報を取得中...\n")
@@ -105,11 +113,11 @@ def get_live_data(date, jcd, rno):
                 if b not in range(1, 7):
                     continue
                 a_tag = cols[2].find('a')
-                name = a_tag.get_text(strip=True).replace('　', '') if a_tag else "不明"
+                name  = a_tag.get_text(strip=True).replace('　', '') if a_tag else "不明"
                 rate_parts  = cols[5].get_text(separator=" ", strip=True).split()
                 motor_parts = cols[7].get_text(separator=" ", strip=True).split()
                 race_list_data[b] = {
-                    "racer_name":       name,
+                    "racer_name":        name,
                     "national_win_rate": rate_parts[0]  if rate_parts            else None,
                     "motor_2ren":        motor_parts[1] if len(motor_parts) > 1  else None,
                 }
@@ -125,25 +133,36 @@ def get_live_data(date, jcd, rno):
     )
     wind_speed, wave_height = 0.0, 0.0
     try:
-        w = soup_before.find("div", class_="is-wind").find("span", class_="weather1_bodyUnitLabelData")
-        if w: wind_speed  = float(w.get_text(strip=True).replace('m', ''))
-        v = soup_before.find("div", class_="is-wave").find("span", class_="weather1_bodyUnitLabelData")
-        if v: wave_height = float(v.get_text(strip=True).replace('cm', ''))
+        w = soup_before.find("div", class_="is-wind")
+        if w:
+            s = w.find("span", class_="weather1_bodyUnitLabelData")
+            if s: wind_speed = float(s.get_text(strip=True).replace('m', ''))
+        v = soup_before.find("div", class_="is-wave")
+        if v:
+            s = v.find("span", class_="weather1_bodyUnitLabelData")
+            if s: wave_height = float(s.get_text(strip=True).replace('cm', ''))
     except Exception:
         pass
 
-    before_data = {}
+    before_data  = {}
+    course_order = 0
     for tbody in soup_before.find_all("tbody"):
         for row in tbody.find_all("tr"):
             cols = row.find_all("td")
             if len(cols) >= 6:
                 try:
-                    b = int(unicodedata.normalize('NFKC', cols[0].get_text(strip=True)))
-                    if b in range(1, 7):
-                        before_data[b] = {
-                            "exhibition_time": cols[4].get_text(strip=True),
-                            "tilt":            cols[5].get_text(strip=True),
-                        }
+                    raw = unicodedata.normalize('NFKC', cols[0].get_text(strip=True))
+                    if not raw or not raw[0].isdigit():
+                        continue
+                    b = int(raw[0])
+                    if b not in range(1, 7):
+                        continue
+                    course_order += 1
+                    before_data[b] = {
+                        "course":          course_order,
+                        "exhibition_time": cols[4].get_text(strip=True),
+                        "tilt":            cols[5].get_text(strip=True),
+                    }
                 except Exception:
                     pass
 
@@ -165,66 +184,124 @@ def get_live_data(date, jcd, rno):
                 })
             except (ValueError, TypeError):
                 pass
-
     return pd.DataFrame(rows)
 
 
+def get_odds(date, jcd, rno) -> dict:
+    """
+    3連単オッズを {(1着艇, 2着艇, 3着艇): 払戻金額} で返す。
+    例: {(2,1,3): 4200, ...}
+    払戻は100円賭けたときの払戻金（テラ銭控除後）。
+    """
+    url  = f"https://www.boatrace.jp/owpc/pc/race/oddstf?rno={rno}&jcd={jcd}&hd={date}"
+    odds = {}
+    sep  = re.compile(r'[-−ー]')
+    try:
+        soup = BeautifulSoup(requests.get(url, timeout=10).content, 'html.parser')
+        for row in soup.find_all("tr"):
+            cells = row.find_all("td")
+            for i, cell in enumerate(cells):
+                raw = unicodedata.normalize('NFKC', cell.get_text(strip=True))
+                parts = sep.split(raw)
+                if (len(parts) == 3
+                        and all(p.isdigit() and 1 <= int(p) <= 6 for p in parts)):
+                    combo = (int(parts[0]), int(parts[1]), int(parts[2]))
+                    for j in range(i + 1, min(i + 3, len(cells))):
+                        pay_raw = unicodedata.normalize('NFKC', cells[j].get_text(strip=True))
+                        pay_num = re.sub(r'[^\d]', '', pay_raw)
+                        if pay_num and int(pay_num) >= 100:
+                            odds[combo] = int(pay_num)
+                            break
+    except requests.exceptions.RequestException:
+        pass
+    return odds
+
+
+# ── 直前情報取得 ───────────────────────────────────────────────
 live_df = get_live_data(TARGET_DATE, JCD, TARGET_RACE)
 
 if len(live_df) != 6:
-    print("❌ 直前情報がまだ公開されていないか、欠場艇があります。")
-    print("展示航走後（レース開始約20分前）に再実行してください。")
+    print("❌ 直前情報が公開されていないか、欠場艇があります。")
+    print("展示航走後（発走約20分前）に再実行してください。")
     exit()
 
 live_df = add_features(live_df)
 
-# ── 予測と買い目出力 ──────────────────────────────────────────
-print(f"=== 📊 AI確率分析 ({TARGET_RACE}R) ===")
+# ── モデル推論 ─────────────────────────────────────────────────
 probs = model.predict_proba(live_df[FEATURES])
+live_df = live_df.copy()
 live_df['prob_1st'] = probs[:, 0]
 live_df['prob_2nd'] = probs[:, 1]
 live_df['prob_3rd'] = probs[:, 2]
 
+# Plackett-Luce に使う "強度" スコア (softmax 前の生スコアを使う)
+pl_scores = dict(zip(live_df['boat_num'].astype(int), live_df['prob_1st']))
+# レース内 softmax で「見やすい確率」を計算（表示用）
+total_s = sum(pl_scores.values())
+norm_1st = {b: s / total_s for b, s in pl_scores.items()} if total_s else pl_scores
+
+print(f"=== 📊 AI確率分析 ({TARGET_RACE}R) ===")
 for _, row in live_df.iterrows():
+    b   = int(row['boat_num'])
+    p1  = norm_1st[b] * 100
+    p2  = row['prob_2nd'] * 100
+    p3  = row['prob_3rd'] * 100
     print(
-        f"{int(row['boat_num'])}号艇 [{row['racer_name']:　<4}]: "
-        f"1着 {row['prob_1st']*100:4.1f}% | "
-        f"2着 {row['prob_2nd']*100:4.1f}% | "
-        f"3着 {row['prob_3rd']*100:4.1f}%  "
+        f"{b}号艇 [{row['racer_name']:　<4}]: "
+        f"1着 {p1:4.1f}% | 2着 {p2:4.1f}% | 3着 {p3:4.1f}%  "
         f"(展示: {row['exhibition_time']})"
     )
 
-print("\n=== 💡 最終ジャッジ ===")
-boat1_prob   = live_df[live_df['boat_num'] == 1]['prob_1st'].values[0]
-non1         = live_df[live_df['boat_num'] != 1]
-boat_1st     = non1.loc[non1['prob_1st'].idxmax()]
-racer_1st    = boat_1st['racer_name']
-pivot_boat   = int(boat_1st['boat_num'])
+# ── オッズ取得 ─────────────────────────────────────────────────
+print("\nオッズを取得中...")
+odds_dict = get_odds(TARGET_DATE, JCD, TARGET_RACE)
 
-if boat1_prob >= 0.50:
-    print(f"⚠️ 1号艇の勝率が {boat1_prob*100:.1f}% と高いため【 見 送 り 】を推奨します。")
-elif boat_1st['prob_1st'] < THRESHOLD_1ST:
-    print(
-        f"⚠️ 穴候補の {pivot_boat}号艇 ({racer_1st}) の勝率が "
-        f"{boat_1st['prob_1st']*100:.1f}% と基準（{THRESHOLD_1ST*100:.0f}%）未満のため【 見 送 り 】を推奨します。"
-    )
+print(f"\n=== 💡 最終ジャッジ ===")
+
+if not odds_dict:
+    # ── フォールバック: 旧ロジック（オッズ未取得時） ─────────────
+    print("⚠️ オッズ未取得。発走10分前に再実行してください。")
+    print("（参考）最も1着確率が高い艇:")
+    top = max(norm_1st.items(), key=lambda x: x[1])
+    print(f"  → {top[0]}号艇 {top[1]*100:.1f}%")
 else:
-    print(
-        f"🔥 チャンス！ {pivot_boat}号艇 ({racer_1st}) が1号艇を沈める確率: "
-        f"{boat_1st['prob_1st']*100:.1f}%"
-    )
-    remain = live_df[live_df['boat_num'] != pivot_boat]
-    boats_2nd = remain.nlargest(NUM_2ND, 'prob_2nd')['boat_num'].astype(int).tolist()
-    boats_3rd = remain.nlargest(NUM_3RD, 'prob_3rd')['boat_num'].astype(int).tolist()
+    # ── メインロジック: EV × Kelly ─────────────────────────────
+    ev_list = []
+    for combo, payout in odds_dict.items():
+        prob = plackett_luce_prob(pl_scores, combo)
+        # 期待値 = prob × 払戻 / 100 - 1
+        ev = prob * (payout / 100.0) - 1.0
+        if ev > MIN_EV:
+            kf_raw  = kelly_fraction(prob, payout)
+            kf_used = min(kf_raw * (0.5 if HALF_KELLY else 1.0), KELLY_CAP)
+            ev_list.append({
+                'ticket':  f"{combo[0]}-{combo[1]}-{combo[2]}",
+                'payout':  payout,
+                'prob':    prob,
+                'ev':      ev,
+                'kelly':   kf_used,
+            })
 
-    tickets = [
-        f"{pivot_boat}-{b2}-{b3}"
-        for b2 in boats_2nd
-        for b3 in boats_3rd
-        if b2 != b3
-    ]
+    ev_list.sort(key=lambda x: x['ev'], reverse=True)
 
-    print(f"\n💰 【穴狙い推奨買い目（3連単 {len(tickets)}点）】")
-    for t in tickets:
-        print(f" ☑️ {t}")
-    print("\n※統計上 回収率239.4% の期待値の設定です。")
+    if not ev_list:
+        print("⚠️ 期待値プラスの買い目が見つかりません。【 見 送 り 】を推奨します。")
+    else:
+        print(f"🔥 期待値プラスの買い目: {len(ev_list)}点")
+        print()
+        print(f"{'買い目':<10} {'払戻':>7} {'AI確率':>7} {'期待値':>8} {'Kelly推奨':>10}")
+        print("-" * 50)
+        for r in ev_list[:15]:
+            kpct = r['kelly'] * 100
+            print(
+                f"☑️ {r['ticket']:<8} "
+                f"{r['payout']:>7,}円 "
+                f"{r['prob']*100:>6.2f}% "
+                f"{r['ev']*100:>+7.1f}% "
+                f"{kpct:>9.2f}%"
+            )
+        print()
+        print("※ Kelly推奨は資金の何%を賭けるべきかの目安（半Kelly適用済）")
+        print("※ 期待値 = AI予測確率 × 払戻 / 100 - 1")
+        if len(ev_list) > 15:
+            print(f"（他 {len(ev_list)-15}点 省略）")
